@@ -1,0 +1,99 @@
+// Truck multiplayer server (Node.js + Socket.io) - server-authoritative.
+// Clients send only INPUTS (throttle, brake, steering, switches). The server runs the physics for every truck,
+// owns the real position/speed, validates everything, and broadcasts state with interest management + deltas.
+// Run: npm install && npm start   (then open http://<server-ip>:3000)
+const http=require('http'),fs=require('fs'),path=require('path'),{Server}=require('socket.io');
+const PORT=process.env.PORT||3000,GAME=process.env.GAME_FILE||path.join(__dirname,'..','eeee_mp.html');
+const MAX_PLAYERS=10,TICK_HZ=15,PHYS_HZ=30,INTEREST=100;
+const GARAGE={x0:-45,x1:45,z0:-125,z1:-75};
+const SLOTS=Array.from({length:MAX_PLAYERS},(_,i)=>({x:-32+(i%5)*16,z:i<5?-90:-112,h:0}));
+const inGarage=(x,z)=>x>GARAGE.x0&&x<GARAGE.x1&&z>GARAGE.z0&&z<GARAGE.z1;
+// ---- physics: the SAME driving model the game uses for every truck (gearbox, shifting, braking, steering) ----
+const GM=[0,15,29,45,62,80,97.22],L=3.97,D=Math.PI/180,C={GM,L,D};
+const cl=(v,a,b)=>Math.min(b,Math.max(a,v));
+const OPT={engine:true,neutral:false,power:false,retarder:0,cruise:false,cruiseSpeed:0};
+function driveStep(p,P,I,o,dt,C){ // ONE driving model for every truck: p = that truck's own state, P = its position
+ const GM=C.GM,L=C.L,D=C.D,cl=(v,a,b)=>Math.min(b,Math.max(a,v));
+ const gasIn=(o.engine&&!o.neutral)?(I.gas||0):0,brkIn=I.brake||0;
+ p.thr+=(gasIn-p.thr)*Math.min(1,dt*2.2);p.brk+=(brkIn-p.brk)*Math.min(1,dt*9);
+ const key=I.key||0,av=Math.abs(p.speed);
+ if(I.uiT!==undefined)p.uiT=cl(I.uiT,-900,900);else if(key)p.uiT=cl(p.uiT+key*320*dt,-900,900);else if(!I.drag){const r=(2200+av*20)*dt;p.uiT=Math.abs(p.uiT)<r?0:p.uiT-Math.sign(p.uiT)*r}
+ const prevS=p.steer;p.steer=p.uiT;const sRate=(p.steer-prevS)/Math.max(dt,1e-3);
+ let shifted=false;
+ if(p.shiftT>0)p.shiftT-=dt;else if(!p.rev){if(p.gear<6&&av>GM[p.gear]*.9&&p.thr>.2){p.gear++;p.shiftT=.45;shifted=true}else if(p.gear>1&&av<GM[p.gear-1]*.72){p.gear--;p.shiftT=.3;shifted=true}}
+ const gmax=p.rev?5.5:GM[p.gear];let a=0;
+ if(p.shiftT<=0&&p.thr>.02){const room=Math.max(0,1-av/gmax);a=p.thr*(p.rev?1.8:(o.power?10:9)-p.gear*.9)*(p.rev?Math.min(1,.12+room*2.2):Math.min(1,.45+room*2.2))}
+ const drag_=.006*p.speed+.00005*p.speed*av+Math.sign(p.speed)*.08;let v=p.speed+((p.rev?-a:a)-drag_)*dt;const retarderForce=o.retarder>0&&p.gear>=3&&p.gear<=5?o.retarder*.32:0;
+ const cruiseErr=o.cruise?o.cruiseSpeed/3.6-av:0;
+ if(o.cruise&&o.engine&&!brkIn&&!p.hand)p.thr=cl(cruiseErr*.45,0,.72);
+ const bd=(p.brk*(4.8+av*.12)*(.5+.25*(I.brkLevel||4))+(p.hand?3.5:0)+retarderForce)*dt;if(Math.abs(v)<=bd)v=0;else v-=Math.sign(v)*bd;
+ const pv=p.speed;p.speed=cl(v,-5.5,GM[6]);p.ax+=((p.speed-pv)/dt-p.ax)*Math.min(1,dt*4);
+ const rt=p.shiftT>0?950:650+(av/gmax)*1250+p.thr*(av<.5?900:140);p.rpm+=(rt-p.rpm)*Math.min(1,dt*(p.shiftT>0?9:4.5));
+ const sn=cl(p.steer/900,-1,1),wd=Math.sign(sn)*Math.pow(Math.abs(sn),.6)*42,wEff=wd*D/(1+Math.pow(av/12,2));let yaw=-(p.speed/L)*Math.tan(wEff);if(av>.1)yaw=cl(yaw,-5.5/av,5.5/av);
+ p.heading+=yaw*dt;P.x+=Math.sin(p.heading)*p.speed*dt;P.z+=Math.cos(p.heading)*p.speed*dt;p.lat+=(p.speed*-yaw-p.lat)*Math.min(1,dt*5);p.wd=wd;
+ return{gasIn,brkIn,key,av,prevS,sRate,gmax,a,drag_,v,retarderForce,cruiseErr,bd,pv,rt,sn,wd,wEff,yaw,shifted}}
+function simTruck(p,dt){const pz=p.pos.z;
+ driveStep(p,p.pos,{gas:p.in.gas,brake:p.in.brake,uiT:p.in.steer},p.opt||OPT,dt,C);wall(p,pz)}
+function wall(p,pz){const G=GARAGE,HW=1.6,x=p.pos.x,z=p.pos.z;if(!(x>G.x0-HW&&x<G.x1+HW&&z>G.z0-6&&z<G.z1+3))return;
+ if(x<G.x0+HW&&x>G.x0-HW){if(pz<G.z1+1&&z<G.z1+1)p.pos.x=G.x0+HW;p.speed=0}
+ if(x>G.x1-HW&&x<G.x1+HW){if(pz<G.z1+1&&z<G.z1+1)p.pos.x=G.x1-HW;p.speed=0}
+ if(z<G.z0+6&&z>G.z0-6&&x>G.x0&&x<G.x1){p.pos.z=G.z0+6;p.speed=0}
+ if(Math.abs(x)>8-HW&&x>G.x0&&x<G.x1&&Math.abs(z-G.z1)<1.6){p.pos.z=pz<G.z1?G.z1-1.6:G.z1+1.6;p.speed=0}}
+
+const srv=http.createServer((q,r)=>{
+  if(q.url==='/health'){r.writeHead(200,{'Content-Type':'text/plain'});r.end('ok');return}
+  if((q.url==='/'||q.url.startsWith('/?'))&&!fs.existsSync(GAME)){r.writeHead(200,{'Content-Type':'text/plain; charset=utf-8'});r.end('Truck server OK');return}
+  if(q.url==='/'||q.url.startsWith('/?')){fs.createReadStream(GAME).on('error',()=>{r.writeHead(404);r.end('Game file not found: '+GAME)}).once('open',()=>r.writeHead(200,{'Content-Type':'text/html; charset=utf-8'})).pipe(r)}
+  else{r.writeHead(404);r.end()}});
+const io=new Server(srv,{cors:{origin:'*'}});
+const players=new Map(); // socket.id -> player; each player OWNS exactly one truck (slot)
+const q2=v=>Math.round(v*100)/100;
+const pos=p=>p.s.pos;
+const near=(a,b)=>(inGarage(pos(a).x,pos(a).z)&&inGarage(pos(b).x,pos(b).z))||Math.hypot(pos(a).x-pos(b).x,pos(a).z-pos(b).z)<=INTEREST;
+// f bits: 1 horn, 2 lights, 4 left indicator, 8 right indicator, 16 handbrake, 32 left door, 64 right door, 128 reverse, 256 braking
+function snap(p){const s=p.s;return{x:q2(s.pos.x),z:q2(s.pos.z),h:Math.round(s.heading*1000)/1000,v:Math.round(s.speed*10)/10,w:Math.round(s.wd||0),f:(p.f&~256)|(s.brk>.15?256:0)}}
+
+io.on('connection',sk=>{
+  const used=new Set([...players.values()].map(p=>p.slot));
+  let slot=-1;for(let i=0;i<MAX_PLAYERS;i++)if(!used.has(i)){slot=i;break}
+  if(slot<0){sk.emit('full');sk.disconnect(true);return}
+  const sp=SLOTS[slot];
+  const p={id:sk.id,slot,f:0,seq:0,known:new Map(),
+    s:{speed:0,heading:sp.h,gear:1,rpm:650,rev:false,hand:false,wd:0,thr:0,brk:0,shiftT:0,ax:0,lat:0,uiT:0,steer:0,pos:{x:sp.x,z:sp.z},opt:{...OPT},in:{gas:0,brake:0,steer:0}}};
+  players.set(sk.id,p);
+  sk.emit('welcome',{id:sk.id,slot,spawn:sp,garage:GARAGE,slots:SLOTS,tick:TICK_HZ});
+  // INPUT only. There is no way to send a position, so speed/teleport hacks are impossible by design.
+  sk.on('in',m=>{if(!m||typeof m!=='object')return;const {seq,gas,brake,steer,f}=m;
+    if(![seq,gas,brake,steer,f].every(Number.isFinite))return;
+    const s=p.s,I=s.in;I.gas=cl(gas,0,1);I.brake=cl(brake,0,1);I.steer=cl(steer,-900,900);
+    const q=m.o;if(q&&typeof q==='object')s.opt={engine:!!q.e,neutral:!!q.n,power:!!q.pw,retarder:cl(+q.rt||0,0,3),cruise:!!q.cr,cruiseSpeed:cl(+q.cs||0,0,120)};
+    const rev=!!(f&128);if(rev!==s.rev&&Math.abs(s.speed)<.5)s.rev=rev; // can only change direction when stopped
+    s.hand=!!(f&16);p.f=(f&~128)|(s.rev?128:0);p.seq=seq|0});
+  sk.on('chat',t=>{if(typeof t!=='string')return;t=t.slice(0,120);
+    for(const [id,o] of players)if(id===sk.id||near(p,o))io.to(id).emit('chat',{from:p.slot+1,t})});
+  sk.on('pingc',t=>sk.emit('pongc',t));
+  sk.on('disconnect',()=>{players.delete(sk.id)}); // slot freed automatically
+});
+
+let lastPhys=Date.now();
+setInterval(()=>{const now=Date.now(),dt=Math.min(.1,(now-lastPhys)/1000);lastPhys=now;
+  for(const p of players.values())simTruck(p.s,dt)},1000/PHYS_HZ);
+
+setInterval(()=>{ // interest management + delta compression, once per network tick
+  const now=Date.now();
+  for(const [id,a] of players){
+    io.to(id).emit('me',{seq:a.seq,x:q2(pos(a).x),z:q2(pos(a).z),h:Math.round(a.s.heading*1000)/1000,v:Math.round(a.s.speed*10)/10});
+    const upd=[],gone=[],seen=new Set();
+    for(const [oid,b] of players){
+      if(oid===id||!near(a,b))continue;seen.add(oid);
+      const cur=snap(b),old=a.known.get(oid);
+      if(!old){upd.push({i:oid,s:b.slot,...cur});a.known.set(oid,cur);continue}
+      const d={};let ch=false;for(const k in cur)if(cur[k]!==old[k]){d[k]=cur[k];ch=true}
+      if(ch){upd.push({i:oid,...d});a.known.set(oid,cur)}
+    }
+    for(const oid of a.known.keys())if(!seen.has(oid)){gone.push(oid);a.known.delete(oid)}
+    if(upd.length||gone.length)io.to(id).emit('w',{t:now,u:upd,g:gone});
+  }
+},1000/TICK_HZ);
+
+srv.listen(PORT,()=>console.log('Truck server on :'+PORT+' | serving '+GAME));
