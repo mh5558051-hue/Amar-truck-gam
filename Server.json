@@ -63,14 +63,14 @@ io.on('connection',sk=>{
  for(const o of players.values())if(o!==p&&o.st)o.dirty=true; // the newcomer sees everybody on the very next tick
 
  // player state: [x, y, z, heading, speed, wheelAngle, flags, t]   (flags: 1 horn, 2 lights, 4/8 indicators, 16 handbrake,
- //                                                                  32/64 doors, 128 reverse, 256 braking, 512 engine on)
+ //                                                                  32/64 doors, 128 reverse, 256 braking, 512 engine on, 1024 wrecked/dead)
  sk.on('s',m=>{
   if(!Array.isArray(m)||m.length<8)return;
   const now=Date.now();if(now-p.win>1000){p.win=now;p.cnt=0}if(++p.cnt>MAX_MSG_PER_SEC)return; // flood protection
   for(let i=0;i<8;i++)if(typeof m[i]!=='number'||!Number.isFinite(m[i]))return;
   const x=r2(cl(m[0],-WORLD,WORLD)),y=r2(cl(m[1],-100,1000)),z=r2(cl(m[2],-WORLD,WORLD));
   let h=m[3]%(2*Math.PI);if(h>Math.PI)h-=2*Math.PI;if(h<-Math.PI)h+=2*Math.PI;h=Math.round(h*1000)/1000;
-  const v=Math.round(cl(m[4],-10,110)*10)/10,w=Math.round(cl(m[5],-45,45)),f=cl(m[6]|0,0,1023),t=Math.round(m[7]);
+  const v=Math.round(cl(m[4],-10,110)*10)/10,w=Math.round(cl(m[5],-45,45)),f=cl(m[6]|0,0,2047),t=Math.round(m[7]);
   if(p.st&&t<=p.st[8])return; // out-of-order packet
   const sig=x+','+y+','+z+','+h+','+v+','+w+','+f;
   p.st=[p.slot,x,y,z,h,v,w,f,t];
