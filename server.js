@@ -1,4 +1,4 @@
-// Truck multiplayer server (Node.js + Socket.io) - PLAYER-SYNC RELAY ONLY.   netcode v3
+// Truck multiplayer server (Node.js + Socket.io) - PLAYER-SYNC RELAY ONLY.   netcode v4
 //
 // The phone runs ALL driving (physics, steering, brake, horn, map, sound) locally. This server never simulates
 // anything. It only:
@@ -22,8 +22,9 @@ const ROOT=path.resolve(process.env.PUBLIC_DIR||__dirname);
 const GAME=process.env.GAME_FILE||'index.html';
 const MAX_PLAYERS=10,MAX_MSG_PER_SEC=40;
 const TICK_HZ=15;                                        // server broadcast rate (clients send at the same rate when something changes)
-const NEAR_IN=300,NEAR_OUT=330;                          // interest radius (m). A player leaves your radius at NEAR_OUT so border cases don't flicker.
+const NEAR_IN=600,NEAR_OUT=650;                          // interest radius (m). A player leaves your radius at NEAR_OUT so border cases don't flicker.
 const FAR_BEACON_MS=1000;                                // far players: 1 packet/sec for the minimap. 0 = send NOTHING about far players
+const SNAP_MS=400;                                       // every viewer gets a RELIABLE (non-volatile) full snapshot this often, so a dropped packet can never leave a truck invisible
 const SAME_MS=300;                                       // an unchanged state is only re-forwarded after this long (guards against clients that send every tick)
 const SPAWN_GAP=9,SPAWN_BEHIND=20,SPAWN_JITTER=2;       // spawn: min distance to anybody (m) / fallback spacing behind the previous player / random sideways offset
 const GARAGE={x0:-45,x1:45,z0:-125,z1:-75};
@@ -82,6 +83,8 @@ io.on('connection',sk=>{
  const peers=[...players.values()].filter(o=>o!==p).map(o=>({s:o.slot}));
  sk.emit('welcome',{id:sk.id,slot,spawn:p.spawn,garage:GARAGE,slots:SLOTS,hz:TICK_HZ,near:NEAR_IN,peers});
  sk.broadcast.emit('join',{s:slot});
+ {const snap=[...players.values()].filter(o=>o!==p&&o.st).map(o=>Math.hypot(o.st[1]-p.spawn.x,o.st[3]-p.spawn.z)<=NEAR_IN?o.st:o.st.concat(1));if(snap.length)sk.emit('w',snap)} // reliable: existing players are visible at once
+ sk.on('resync',()=>{p.snapAt=0}); // client asks for a fresh snapshot when it knows a player but has no position for it
 
  // player state: [x, y, z, heading, speed, wheelAngle, flags, t]   (flags: 1 horn, 2 lights, 4/8 indicators, 16 handbrake,
  //                                                                  32/64 doors, 128 reverse, 256 braking, 512 engine on, 1024 wrecked/dead)
@@ -93,7 +96,9 @@ io.on('connection',sk=>{
   let h=m[3]%(2*Math.PI);if(h>Math.PI)h-=2*Math.PI;if(h<-Math.PI)h+=2*Math.PI;h=Math.round(h*1000)/1000;
   const v=Math.round(cl(m[4],-10,110)*10)/10,w=Math.round(cl(m[5],-45,45)),f=cl(m[6]|0,0,2047),t=Math.round(m[7]);
   if(p.st&&t<=p.st[8])return; // out-of-order packet
+  const first=!p.st;
   p.st=[p.slot,x,y,z,h,v,w,f,t];
+  if(first)for(const q of players.values())if(q!==p)q.sk.emit('w',[p.st]); // first position: reliable, not volatile
   const sig=x+','+y+','+z+','+h+','+v+','+w+','+f;
   if(sig!==p.sig||now-p.verAt>=SAME_MS){p.sig=sig;p.verAt=now;p.ver=++SEQ} // new version -> goes out on the next tick
  });
@@ -108,17 +113,17 @@ setInterval(()=>{
  if(players.size<2)return;
  const now=Date.now();
  for(const v of players.values()){
-  const vx=v.st?v.st[1]:v.spawn.x,vz=v.st?v.st[3]:v.spawn.z,out=[];
+  const vx=v.st?v.st[1]:v.spawn.x,vz=v.st?v.st[3]:v.spawn.z,out=[],due=now-(v.snapAt||0)>=SNAP_MS;if(due)v.snapAt=now;
   for(const o of players.values()){
    if(o===v||!o.st)continue;
    let pr=v.pairs.get(o.sk.id);if(!pr){pr={ver:0,at:0,near:false};v.pairs.set(o.sk.id,pr)}
    const dx=o.st[1]-vx,dz=o.st[3]-vz,lim=pr.near?NEAR_OUT:NEAR_IN,near=dx*dx+dz*dz<=lim*lim;
    if(near){
-    if(!pr.near||pr.ver!==o.ver){out.push(o.st);pr.near=true;pr.ver=o.ver;pr.at=now}          // in range: full-rate stream (10th element absent)
-   }else if(pr.near||(FAR_BEACON_MS>0&&pr.ver!==o.ver&&now-pr.at>=FAR_BEACON_MS)){
+    if(due||!pr.near||pr.ver!==o.ver){out.push(o.st);pr.near=true;pr.ver=o.ver;pr.at=now}          // in range: full-rate stream (10th element absent)
+   }else if(pr.near||(FAR_BEACON_MS>0&&(pr.ver!==o.ver||due)&&now-pr.at>=FAR_BEACON_MS)){
     out.push(o.st.concat(1));pr.near=false;pr.ver=o.ver;pr.at=now}                            // out of range: 'far' flag, tells the phone to hide the 3D truck
   }
-  if(out.length)v.sk.volatile.emit('w',out)}
+  if(out.length){if(due)v.sk.emit('w',out);else v.sk.volatile.emit('w',out)}}
 },1000/TICK_HZ);
 
 srv.listen(PORT,()=>console.log('Truck sync server on :'+PORT+' | '+TICK_HZ+' Hz | interest '+NEAR_IN+' m | serving '+ROOT));
