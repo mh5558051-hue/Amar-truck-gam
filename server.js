@@ -1,4 +1,4 @@
-// Truck multiplayer server (Node.js + Socket.io) - PLAYER-SYNC RELAY ONLY.   netcode v4
+// Truck multiplayer server (Node.js + Socket.io) - PLAYER-SYNC RELAY ONLY.   netcode v5
 //
 // The phone runs ALL driving (physics, steering, brake, horn, map, sound) locally. This server never simulates
 // anything. It only:
@@ -15,14 +15,17 @@
 // folder, so the 3D model and the engine sounds load when you open  http://<server>:3000
 //
 // Run:  npm install && npm start
-const http=require('http'),fs=require('fs'),path=require('path'),{Server}=require('socket.io');
+const http=require('http'),fs=require('fs'),path=require('path'),zlib=require('zlib'),{Server}=require('socket.io');
+// RELAY_ONLY=1 -> this server sends NO game files at all (host index.html / mdl.txt / audio.json on any static host and point config.js SERVER_URL here).
+// Then the phone only relays tiny player packets: no map, no model, no sound ever leaves it.
+const RELAY_ONLY=/^(1|true|yes)$/i.test(process.env.RELAY_ONLY||'');
 
 const PORT=process.env.PORT||3000;                       // Render gives the port in process.env.PORT
 const ROOT=path.resolve(process.env.PUBLIC_DIR||__dirname);
 const GAME=process.env.GAME_FILE||'index.html';
 const MAX_PLAYERS=10,MAX_MSG_PER_SEC=40;
-const TICK_HZ=15;                                        // server broadcast rate (clients send at the same rate when something changes)
-const NEAR_IN=600,NEAR_OUT=650;                          // interest radius (m). A player leaves your radius at NEAR_OUT so border cases don't flicker.
+const TICK_HZ=Math.max(5,Math.min(30,+process.env.TICK_HZ||15));                                        // server broadcast rate (clients send at the same rate when something changes)
+const NEAR_IN=200,NEAR_OUT=220;                          // interest radius (m). A player leaves your radius at NEAR_OUT so border cases don't flicker.
 const FAR_BEACON_MS=1000;                                // far players: 1 packet/sec for the minimap. 0 = send NOTHING about far players
 const SNAP_MS=400;                                       // every viewer gets a RELIABLE (non-volatile) full snapshot this often, so a dropped packet can never leave a truck invisible
 const SAME_MS=300;                                       // an unchanged state is only re-forwarded after this long (guards against clients that send every tick)
@@ -37,17 +40,26 @@ const MIME={'.html':'text/html; charset=utf-8','.js':'application/javascript; ch
  '.svg':'image/svg+xml','.ico':'image/x-icon','.glb':'model/gltf-binary','.wav':'audio/wav','.mp3':'audio/mpeg','.ogg':'audio/ogg'};
 const PRIVATE=new Set(['server.js','server.txt','package.json','package-lock.json']);
 const send=(r,code,type,body)=>{r.writeHead(code,{'Content-Type':type});r.end(body)};
+const GZ=new Map(),GZT=new Set(['.html','.js','.json','.txt','.css','.svg']); // gzip once per file version, then served from memory
+function gz(file,st,cb){const k=file+'|'+st.size+'|'+Math.round(st.mtimeMs);const h=GZ.get(k);if(h&&h.buf)return cb(h.buf);
+ if(h)return h.q.push(cb);const e={buf:null,q:[cb]};for(const x of GZ.keys())if(x.startsWith(file+'|'))GZ.delete(x);GZ.set(k,e);
+ fs.readFile(file,(er,raw)=>{if(er){GZ.delete(k);return e.q.forEach(f=>f(null))}zlib.gzip(raw,{level:6},(er2,out)=>{if(er2){GZ.delete(k);return e.q.forEach(f=>f(null))}e.buf=out;e.q.forEach(f=>f(out))})})}
 function serveFile(q,r,file){
  fs.stat(file,(err,st)=>{
   if(err||!st.isFile())return send(r,404,'text/plain; charset=utf-8','Not found');
-  const etag='"'+st.size+'-'+Math.round(st.mtimeMs)+'"';
+  const ext=path.extname(file).toLowerCase(),etag='"'+st.size+'-'+Math.round(st.mtimeMs)+'"';
   if(q.headers['if-none-match']===etag){r.writeHead(304,{ETag:etag});return r.end()}
-  r.writeHead(200,{'Content-Type':MIME[path.extname(file).toLowerCase()]||'application/octet-stream','Content-Length':st.size,
-   ETag:etag,'Cache-Control':'no-cache','Access-Control-Allow-Origin':'*'});
+  const hdr={'Content-Type':MIME[ext]||'application/octet-stream',ETag:etag,'Access-Control-Allow-Origin':'*',Vary:'Accept-Encoding',
+   'Cache-Control':(ext==='.html'||ext==='.js')?'no-cache':'public, max-age=3600'}; // big assets (model, sounds) are cached by the player's phone
+  if(GZT.has(ext)&&st.size>1024&&st.size<40e6&&/\bgzip\b/.test(q.headers['accept-encoding']||''))
+   return gz(file,st,buf=>{if(!buf){r.writeHead(200,Object.assign(hdr,{'Content-Length':st.size}));return fs.createReadStream(file).on('error',()=>r.destroy()).pipe(r)}
+    hdr['Content-Encoding']='gzip';hdr['Content-Length']=buf.length;r.writeHead(200,hdr);r.end(buf)});
+  hdr['Content-Length']=st.size;r.writeHead(200,hdr);
   fs.createReadStream(file).on('error',()=>r.destroy()).pipe(r)})}
 const srv=http.createServer((q,r)=>{
  let u;try{u=decodeURIComponent((q.url||'/').split('?')[0])}catch(e){return send(r,400,'text/plain','Bad request')}
- if(u==='/health')return send(r,200,'text/plain','ok netcode-v3 '+TICK_HZ+'Hz');
+ if(u==='/health')return send(r,200,'text/plain','ok netcode-v5 '+TICK_HZ+'Hz'+(RELAY_ONLY?' relay-only':''));
+ if(RELAY_ONLY)return send(r,404,'text/plain','Relay only');
  if(u==='/')u='/'+GAME;
  const rel=path.normalize(u).replace(/^([/\\])+/,'');
  const file=path.join(ROOT,rel);
@@ -56,7 +68,7 @@ const srv=http.createServer((q,r)=>{
  serveFile(q,r,file)});
 
 // ---------------------------------------------------------------- players
-const io=new Server(srv,{cors:{origin:'*'},pingInterval:10000,pingTimeout:15000});
+const io=new Server(srv,{cors:{origin:'*'},pingInterval:10000,pingTimeout:15000,perMessageDeflate:false,httpCompression:false});
 const players=new Map(); // socket.id -> {sk, slot, spawn, st, ver, verAt, sig, pairs, win, cnt, chatT}
 const cl=(v,a,b)=>Math.min(b,Math.max(a,v));
 const r2=v=>Math.round(v*100)/100;
@@ -78,9 +90,9 @@ io.on('connection',sk=>{
  for(let i=0;i<MAX_PLAYERS;i++)if(!used.has(i))free.push(i);
  if(!free.length){sk.emit('full');sk.disconnect(true);return}
  const slot=free[0];
- const p={sk,slot,spawn:pickSpawn(free),st:null,ver:0,verAt:0,sig:'',pairs:new Map(),win:0,cnt:0,chatT:0};
+ const p={col:undefined,sk,slot,spawn:pickSpawn(free),st:null,ver:0,verAt:0,sig:'',pairs:new Map(),win:0,cnt:0,chatT:0};
  players.set(sk.id,p);
- const peers=[...players.values()].filter(o=>o!==p).map(o=>({s:o.slot}));
+ const peers=[...players.values()].filter(o=>o!==p).map(o=>o.col===undefined?{s:o.slot}:{s:o.slot,c:o.col});
  sk.emit('welcome',{id:sk.id,slot,spawn:p.spawn,garage:GARAGE,slots:SLOTS,hz:TICK_HZ,near:NEAR_IN,peers});
  sk.broadcast.emit('join',{s:slot});
  {const snap=[...players.values()].filter(o=>o!==p&&o.st).map(o=>Math.hypot(o.st[1]-p.spawn.x,o.st[3]-p.spawn.z)<=NEAR_IN?o.st:o.st.concat(1));if(snap.length)sk.emit('w',snap)} // reliable: existing players are visible at once
@@ -102,6 +114,7 @@ io.on('connection',sk=>{
   const sig=x+','+y+','+z+','+h+','+v+','+w+','+f;
   if(sig!==p.sig||now-p.verAt>=SAME_MS){p.sig=sig;p.verAt=now;p.ver=++SEQ} // new version -> goes out on the next tick
  });
+ sk.on('col',c=>{if(!Number.isInteger(c)||c<-1||c>0xFFFFFF)return;p.col=c;sk.broadcast.emit('col',{s:slot,c})}); // the REAL paint colour of this player's truck (-1 = model default): everybody draws it exactly like its owner sees it
  sk.on('chat',t=>{if(typeof t!=='string')return;const now=Date.now();if(now-p.chatT<500)return;p.chatT=now;io.emit('chat',{from:p.slot+1,t:t.slice(0,120)})});
  sk.on('pingc',t=>sk.emit('pongc',t));
  sk.on('disconnect',()=>{players.delete(sk.id);for(const q of players.values())q.pairs.delete(sk.id);io.emit('leave',p.slot)}); // slot is free again
