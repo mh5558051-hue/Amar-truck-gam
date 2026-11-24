@@ -45,10 +45,10 @@ io.on('connection',sk=>{
  const used=new Set([...players.values()].map(p=>p.slot)),free=[];
  for(let i=0;i<MAX_PLAYERS;i++)if(!used.has(i))free.push(i);
  if(!free.length){sk.emit('full');sk.disconnect(true);return}
- const slot=free[0],p={col:undefined,sk,slot,spawn:pickSpawn(free),st:null,ver:0,verAt:0,sig:'',pairs:new Map(),win:0,cnt:0,chatT:0};
+ const slot=free[0],p={col:undefined,sk,slot,spawn:pickSpawn(free),st:null,ver:0,verAt:0,sig:'',ride:-1,pairs:new Map(),win:0,cnt:0,chatT:0};
  players.set(sk.id,p);
  const peers=[...players.values()].filter(o=>o!==p).map(o=>o.col===undefined?{s:o.slot}:{s:o.slot,c:o.col});
- sk.emit('welcome',{id:sk.id,slot,spawn:p.spawn,garage:GARAGE,slots:SLOTS,hz:TICK_HZ,near:NEAR_IN,peers});
+ sk.emit('welcome',{id:sk.id,slot,spawn:p.spawn,garage:GARAGE,slots:SLOTS,hz:TICK_HZ,near:NEAR_IN,peers,seats:[...players.values()].filter(o=>o.ride>=0).map(o=>({s:o.slot,h:o.ride}))});
  sk.broadcast.emit('join',{s:slot});
  {const snap=[...players.values()].filter(o=>o!==p&&o.st&&Math.hypot(o.st[1]-p.spawn.x,o.st[3]-p.spawn.z)<=NEAR_IN).map(o=>o.st);if(snap.length)sk.emit('w',snap)}
  sk.on('resync',()=>{p.snapAt=0});
@@ -59,7 +59,7 @@ io.on('connection',sk=>{
   for(let i=0;i<8;i++)if(typeof m[i]!=='number'||!Number.isFinite(m[i]))return;
   const x=r2(cl(m[0],-WORLD,WORLD)),y=r2(cl(m[1],-100,1000)),z=r2(cl(m[2],-WORLD,WORLD));
   let h=m[3]%(2*Math.PI);if(h>Math.PI)h-=2*Math.PI;if(h<-Math.PI)h+=2*Math.PI;h=Math.round(h*1000)/1000;
-  const v=Math.round(cl(m[4],-10,110)*10)/10,w=Math.round(cl(m[5],-45,45)),f=cl(m[6]|0,0,2047),t=Math.round(m[7]);
+  const v=Math.round(cl(m[4],-10,110)*10)/10,w=Math.round(cl(m[5],-45,45)),f=cl(m[6]|0,0,16383),t=Math.round(m[7]);
   if(p.st&&t<=p.st[8])return;
   const first=!p.st;p.st=[p.slot,x,y,z,h,v,w,f,t];
   if(first)for(const q of players.values())if(q!==p&&Math.hypot(q.st?q.st[1]-x:1e9,q.st?q.st[3]-z:0)<=NEAR_IN)q.sk.emit('w',[p.st]);
@@ -67,8 +67,14 @@ io.on('connection',sk=>{
   if(sig!==p.sig||now-p.verAt>=SAME_MS){p.sig=sig;p.verAt=now;p.ver=++SEQ}});
  sk.on('col',c=>{if(!Number.isInteger(c)||c<-1||c>0xFFFFFF)return;p.col=c;sk.broadcast.emit('col',{s:slot,c})}); // real paint colour: everyone draws the same
  sk.on('chat',t=>{if(typeof t!=='string')return;const n=Date.now();if(n-p.chatT<500)return;p.chatT=n;io.emit('chat',{from:p.slot+1,t:t.slice(0,120)})});
+ sk.on('seat',m=>{const h=m&&Number.isInteger(m.h)?m.h:-1;
+  if(h<0){if(p.ride>=0){p.ride=-1;io.emit('seat',{s:slot,h:-1})}return}
+  const vs=[...players.values()],host=vs.find(o=>o.slot===h);
+  if(!host||host===p||host.ride>=0||vs.some(o=>o.ride===h)){sk.emit('seat',{s:slot,h:-1,no:1});return}
+  p.ride=h;io.emit('seat',{s:slot,h})}); // 1 helper per truck; the driver seat is never offered
+ sk.on('door',m=>{if(!m||!Number.isInteger(m.h))return;const host=[...players.values()].find(o=>o.slot===m.h);if(host&&host!==p)host.sk.emit('door',{o:m.o?1:0})}); // visitor asks the owner's phone to open/close the helper door
  sk.on('pingc',t=>sk.emit('pongc',t));
- sk.on('disconnect',()=>{players.delete(sk.id);for(const q of players.values())q.pairs.delete(sk.id);io.emit('leave',p.slot)})});
+ sk.on('disconnect',()=>{players.delete(sk.id);for(const q of players.values())if(q.ride===slot){q.ride=-1;io.emit('seat',{s:q.slot,h:-1})}for(const q of players.values())q.pairs.delete(sk.id);io.emit('leave',p.slot)})});
 setInterval(()=>{
  if(players.size<2)return;
  const now=Date.now();
@@ -85,3 +91,4 @@ setInterval(()=>{
   if(out.length){if(due)v.sk.emit('w',out);else v.sk.volatile.emit('w',out)}}
 },1000/TICK_HZ);
 srv.listen(PORT,()=>console.log('Truck sync server :'+PORT+' | '+TICK_HZ+' Hz | interest '+NEAR_IN+' m'));
+  
