@@ -91,3 +91,4 @@ setInterval(()=>{
   if(out.length){if(due)v.sk.emit('w',out);else v.sk.volatile.emit('w',out)}}
 },1000/TICK_HZ);
 srv.listen(PORT,()=>console.log('Truck sync server :'+PORT+' | '+TICK_HZ+' Hz | interest '+NEAR_IN+' m'));
+   
